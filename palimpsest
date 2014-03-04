@@ -1,0 +1,171 @@
+#!/usr/bin/env python
+"""
+Manages a copy-on-write filesystem backed by loopback devices, using
+`dmsetup(1)` and `losetup(1)`.
+
+For example, you can:
+
+* create a filesystem image in a sparse file and mount it
+* write some data to it and unmount it
+* create a "layer" file backed by the data you just wrote and mount that
+* make some changes to data you write, then umount and destroy the layer
+* mount the base file again, see that no changes were made
+"""
+
+from argparse import ArgumentParser
+from subprocess import check_output
+import os
+import pipes
+
+
+def _run(command, sudo=True, show=True):
+    """
+    Runs a command in a shell, returns its output.
+    """
+    if sudo:
+        command = 'sudo bash -c %s' % pipes.quote(command)
+    if show:
+        print command
+    return check_output(command, shell=True)
+
+
+def do_base_create(args):
+    """
+    Create a base file.
+    """
+    if os.path.exists(args.filename):
+        raise Exception('file exists: %s' % args.filename)
+    _run('truncate -s%dG %s' % (args.size, args.filename))
+    loop = _run('losetup -f --show %s' % args.filename).strip()
+    _run('ln -s %s %s.lo' % (loop, args.filename))
+    _run('mkfs.%s -m0 %s' % (args.fs_type, loop))
+    if args.mountpoint:
+        do_base_mount(args)
+
+
+def do_base_mount(args):
+    """
+    Mount a base file.
+    """
+    if not os.path.islink(args.filename + '.lo'):
+        raise Exception('no loopback device for %s' % args.filename)
+    _run('mkdir -p %s' % args.mountpoint)
+    _run('mount %s.lo %s' % (args.filename, args.mountpoint))
+
+
+def do_base_destroy(args):
+    """
+    Destroy a base file.
+    """
+    _run('losetup -d %s.lo' % args.filename)
+    _run('rm %s %s.lo' % (args.filename, args.filename))
+
+
+def do_layer_create(args):
+    """
+    Create a layer file on top of a base file.
+    """
+    size = os.stat(args.base_filename).st_size
+    _run('truncate -s%d %s' % (size, args.filename))
+
+    loop = _run('losetup -f --show %s' % args.filename).strip()
+    _run('ln -s %s %s.lo' % (loop, args.filename))
+
+    blksize = int(_run('blockdev --getsize %s.lo' % args.filename))
+    dm_name = os.path.basename(args.filename)
+    _run('echo 0 %d snapshot %s.lo %s.lo %s 8 | dmsetup create %s' % (
+        blksize, args.base_filename, args.filename,
+        'P' if not args.transient else 'N', dm_name))
+    _run('ln -s /dev/mapper/%s %s.dm' % (dm_name, args.filename))
+    if args.mountpoint:
+        do_layer_mount(args)
+
+
+def do_layer_mount(args):
+    """
+    Mount a layer file.
+    """
+    if not os.path.islink(args.filename + '.dm'):
+        raise Exception('no mapper for %s' % args.filename)
+    _run('mkdir -p %s' % args.mountpoint)
+    _run('mount %s.dm %s' % (args.filename, args.mountpoint))
+
+
+def do_layer_destroy(args):
+    """
+    Destroy a layer file.
+    """
+    dm_name = os.path.basename(args.filename)
+    _run('dmsetup remove %s' % dm_name)
+    _run('losetup -d %s.lo' % args.filename)
+    _run('rm %s %s.lo' % (args.filename, args.filename))
+
+
+def _get_parser():
+    parser = ArgumentParser(
+        description='Manages copy-on-write loopback filesystems.')
+    subparsers = parser.add_subparsers()
+
+    base_subs = subparsers.add_parser(
+        'base', help='Operations on base files.').add_subparsers()
+
+    base_create = base_subs.add_parser('create')
+    base_create.add_argument('filename', metavar='FILE',
+                             help='the base file to create')
+    base_create.add_argument('size', metavar='GB', type=int,
+                             help='max size of the base file in GB')
+    base_create.add_argument('-m', '--mountpoint', metavar='DIR',
+                             help='where to mount the base file')
+    base_create.add_argument('-f', '--fs-type', metavar='FS',
+                             help='the type of filesystem to create',
+                             default='ext3')
+    base_create.set_defaults(handler=do_base_create)
+
+    base_mount = base_subs.add_parser('mount')
+    base_mount.add_argument('filename', metavar='FILE',
+                            help='an existing base file')
+    base_mount.add_argument('mountpoint', metavar='MOUNT_DIR',
+                            help='where to mount the base file')
+    base_mount.set_defaults(handler=do_base_mount)
+
+    base_destroy = base_subs.add_parser('destroy')
+    base_destroy.add_argument('filename', metavar='FILE',
+                              help='an existing base file')
+    base_destroy.set_defaults(handler=do_base_destroy)
+
+    layer_subs = subparsers.add_parser(
+        'layer', help='Operations on layer files.').add_subparsers()
+
+    layer_create = layer_subs.add_parser('create')
+    layer_create.add_argument('base_filename', metavar='BASE_FILE',
+                              help='an existing base file')
+    layer_create.add_argument('filename', metavar='FILE',
+                              help='the layer file to create')
+    layer_create.add_argument('-m', '--mountpoint', metavar='DIR',
+                              help='where to mount the layer')
+    layer_create.add_argument('-t', '--transient', action='store_true',
+                              help='do not create a persisent snapshot')
+    layer_create.set_defaults(handler=do_layer_create)
+
+    layer_mount = layer_subs.add_parser('mount')
+    layer_mount.add_argument('filename', metavar='FILE',
+                             help='an existing layer file')
+    layer_mount.add_argument('mountpoint', metavar='MOUNT_DIR',
+                             help='where to mount the layer')
+    layer_mount.set_defaults(handler=do_layer_mount)
+
+    layer_destroy = layer_subs.add_parser('destroy')
+    layer_destroy.add_argument('filename', metavar='FILE',
+                               help='an existing layer file')
+    layer_destroy.set_defaults(handler=do_layer_destroy)
+
+    return parser
+
+
+def main():
+    args = _get_parser().parse_args()
+    args.handler(args)
+
+
+if __name__ == '__main__':
+    main()
